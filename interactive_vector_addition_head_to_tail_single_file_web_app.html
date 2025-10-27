@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vector Head-to-Tail Visualizer</title>
+  <style>
+    :root {
+      --bg: #0f1220;
+      --panel: #171a2c;
+      --ink: #e6e8ef;
+      --muted: #aeb3c2;
+      --axis: #6c86ff;
+      --grid: #2a2f4a;
+      --vector: #40c4ff;  /* cyan-ish */
+      --temp: #ffd166;    /* amber */
+      --result: #ff5e76;  /* coral */
+      --good: #5effa1;
+    }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    .wrap { display: grid; grid-template-rows: auto 1fr; min-height: 100vh; height: 100dvh; }
+    header { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem; background: var(--panel); border-bottom: 1px solid #242844; flex-wrap: wrap; position: relative; z-index: 1;}
+    header h1 { font-size: 1rem; margin: 0 .5rem 0 0; color: var(--muted); font-weight: 600; letter-spacing: .3px; }
+    .spacer { flex: 1; }
+    .btn { appearance: none; border: 1px solid #303656; background: #1b1f36; color: var(--ink); padding: .45rem .7rem; border-radius: .6rem; cursor: pointer; font-weight: 600; font-size: .9rem; }
+    .btn:hover { background: #20264a; }
+    .btn:active { transform: translateY(1px); }
+    .chip { font-variant-numeric: tabular-nums; padding: .28rem .5rem; border: 1px dashed #3a4062; border-radius: .6rem; color: var(--muted); }
+    .legend { display:flex; align-items:center; gap:.6rem; margin-left:.5rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display:inline-block; }
+    .v { background: var(--vector); }
+    .r { background: var(--result); }
+    .t { background: var(--temp); }
+    .axis-group { display:flex; align-items:center; gap:.35rem; padding:.25rem .5rem; border:1px solid #303656; border-radius:.6rem; background:#14172b; }
+    .axis-group label { display:flex; align-items:center; gap:.25rem; font-size:.85rem; color: var(--muted); }
+    .axis-group input { accent-color:#6c86ff; }
+    .canvas-wrap { position: relative; }
+    #c { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    .hud { position: absolute; left: 12px; bottom: 12px; background: rgba(23,26,44,.84); padding: .6rem .7rem; border-radius: .6rem; border: 1px solid #2b3150; font-variant-numeric: tabular-nums; }
+    .hud-row { display:flex; gap:.8rem; align-items:center; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .kbd { background:#0c0f1d; border:1px solid #2b3150; padding:.12rem .4rem; border-radius:.35rem; margin: 0 .15rem; }
+    .toast { position: absolute; right: 12px; bottom: 12px; background: #122015; border: 1px solid #1b3d22; color: var(--good); padding: .6rem .7rem; border-radius:.6rem; opacity: 0; transform: translateY(8px); transition: all .25s ease; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Vector Head‑to‑Tail Visualizer</h1>
+      <button id="addBtn" class="btn">➕ Add Vector</button>
+      <button id="undoBtn" class="btn">↶ Undo</button>
+      <button id="clearBtn" class="btn">✖ Clear All</button>
+      <button id="zoomIn" class="btn">🔍＋</button>
+      <button id="zoomOut" class="btn">🔍－</button>
+      <button id="resetView" class="btn">⟲ Fit All</button>
+      <div class="axis-group" title="Angle baseline (axis+direction)">
+        <span style="color:#98a1c0;font-size:.85rem;">Angle from:</span>
+        <label><input type="radio" name="axisBase" value="N">N (+Y)</label>
+        <label><input type="radio" name="axisBase" value="W">W (−X)</label>
+        <label><input type="radio" name="axisBase" value="S">S (−Y)</label>
+        <label><input type="radio" name="axisBase" value="E" checked>E (+X)</label>
+      </div>
+      <div class="legend">
+        <span class="dot v"></span><small>Vectors</small>
+        <span class="dot r"></span><small>Resultant</small>
+        <span class="dot t"></span><small>Creating</small>
+      </div>
+      <div class="spacer"></div>
+      <div id="scaleChip" class="chip mono">scale: 1 unit = 50 px</div>
+    </header>
+
+    <div class="canvas-wrap">
+      <canvas id="c"></canvas>
+      <div class="hud mono" id="hud"></div>
+      <div class="toast" id="toast">Vector added ✔</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const hud = document.getElementById('hud');
+  const toast = document.getElementById('toast');
+  const scaleChip = document.getElementById('scaleChip');
+
+  // State
+  let dpr = Math.max(1, window.devicePixelRatio || 1);
+  let width = 0, height = 0;
+  let scale = 50;               // pixels per world unit
+  const SCALE_MIN = 10, SCALE_MAX = 400;
+  let offset = { x: 0, y: 0 };  // screen offset for world origin (after pan/fit)
+
+  // Angle baseline control (N=+Y, W=-X, S=-Y, E=+X)
+  let baseAxis = 'E';
+  document.querySelectorAll('input[name="axisBase"]').forEach(r => {
+    r.addEventListener('change', () => { baseAxis = r.value; render(); });
+  });
+
+  // Vectors stored as {dx, dy}. Tail positions are derived (head-to-tail from origin)
+  const vectors = [];
+  let creating = false;
+  let mouse = { x: 0, y: 0 };
+
+  // Helpers: screen/world transforms (world: +x right, +y up)
+  function worldToScreen(wx, wy) {
+    return { x: offset.x + wx * scale, y: offset.y - wy * scale };
+  }
+  function screenToWorld(sx, sy) {
+    return { x: (sx - offset.x) / scale, y: (offset.y - sy) / scale };
+  }
+
+  function setCanvasSize() {
+    // Ensure canvas area respects dynamic viewport height and header height
+    const headerEl = document.querySelector('header');
+    const canvasWrap = document.querySelector('.canvas-wrap');
+    const vh = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
+    const headerH = headerEl.getBoundingClientRect().height;
+    const targetH = Math.max(200, vh - headerH);
+    canvasWrap.style.height = targetH + 'px';
+
+    const rect = canvas.getBoundingClientRect();
+    width  = Math.max(200, rect.width);
+    height = Math.max(200, rect.height);
+    canvas.width  = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // Drawing
+  function drawGrid() {
+    ctx.save();
+    ctx.clearRect(0, 0, width, height);
+
+    // Grid
+    const gridStepPx = niceGridStep(scale);
+    ctx.lineWidth = 1;
+
+    // Minor grid
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid');
+    ctx.beginPath();
+    for (let x = offset.x % gridStepPx; x < width; x += gridStepPx) {
+      ctx.moveTo(x, 0); ctx.lineTo(x, height);
+    }
+    for (let y = offset.y % gridStepPx; y < height; y += gridStepPx) {
+      ctx.moveTo(0, y); ctx.lineTo(width, y);
+    }
+    ctx.stroke();
+
+    // Axes
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--axis');
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    // X axis
+    ctx.moveTo(0, offset.y); ctx.lineTo(width, offset.y);
+    // Y axis
+    ctx.moveTo(offset.x, 0); ctx.lineTo(offset.x, height);
+    ctx.stroke();
+
+    // Axis arrows
+    drawArrowRaw(width - 16, offset.y, width - 2, offset.y, '#6c86ff', 2);
+    drawArrowRaw(offset.x, 16, offset.x, 2, '#6c86ff', 2);
+
+    // Cardinal axis labels near borders
+    ctx.fillStyle = '#98a1c0';
+    ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    // E (right), W (left)
+    ctx.fillText('E', width - 12, Math.min(Math.max(offset.y - 6, 12), height - 12));
+    ctx.fillText('W', 6, Math.min(Math.max(offset.y - 6, 12), height - 12));
+    // N (top), S (bottom)
+    ctx.fillText('N', Math.min(Math.max(offset.x + 6, 12), width - 12), 12);
+    ctx.fillText('S', Math.min(Math.max(offset.x + 6, 12), width - 12), height - 6);
+
+    ctx.restore();
+  }
+
+  function niceGridStep(scalePxPerUnit) {
+    // Choose grid step so that lines are ~80px apart visually
+    const target = 80;
+    const raw = target / scalePxPerUnit; // target spacing in world units
+    const pow10 = Math.pow(10, Math.floor(Math.log10(raw)));
+    const frac = raw / pow10;
+    let nice;
+    if (frac < 1.5) nice = 1;
+    else if (frac < 3.5) nice = 2;
+    else if (frac < 7.5) nice = 5;
+    else nice = 10;
+    return nice * pow10 * scalePxPerUnit;
+  }
+
+  function drawVectors() {
+    // Draw each placed vector head‑to‑tail in cyan
+    let tail = { x: 0, y: 0 };
+    vectors.forEach((v) => {
+      const head = { x: tail.x + v.dx, y: tail.y + v.dy };
+      drawArrowWorld(tail, head, getVar('--vector'), 2);
+      drawVectorLabel(tail, head, v, false);
+      tail = head;
+    });
+
+    // Draw resultant in coral
+    const res = resultant();
+    if (res) {
+      drawArrowWorld({x:0,y:0}, res, getVar('--result'), 3);
+      drawVectorLabel({x:0,y:0}, res, {dx: res.x, dy: res.y}, true);
+    }
+
+    // Draw creating vector from origin following mouse
+    if (creating) {
+      const w = screenToWorld(mouse.x, mouse.y);
+      drawArrowWorld({x:0,y:0}, w, getVar('--temp'), 2, [6,6]);
+      drawVectorLabel({x:0,y:0}, w, {dx:w.x, dy:w.y}, false);
+    }
+  }
+
+  function getVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  function drawArrowWorld(tail, head, color, lineWidth=2, dash=null) {
+    const a = worldToScreen(tail.x, tail.y);
+    const b = worldToScreen(head.x, head.y);
+    drawArrowRaw(a.x, a.y, b.x, b.y, color, lineWidth, dash);
+  }
+
+  function drawArrowRaw(x1, y1, x2, y2, color, lineWidth=2, dash=null) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) return;
+    const ux = dx / len, uy = dy / len;
+    const headLen = Math.max(8, Math.min(16, 0.04 * len));
+    const leftX = x2 - headLen * (ux * Math.cos(Math.PI/6) - uy * Math.sin(Math.PI/6));
+    const leftY = y2 - headLen * (uy * Math.cos(Math.PI/6) + ux * Math.sin(Math.PI/6));
+    const rightX = x2 - headLen * (ux * Math.cos(Math.PI/6) + uy * Math.sin(Math.PI/6));
+    const rightY = y2 - headLen * (uy * Math.cos(Math.PI/6) - ux * Math.sin(Math.PI/6));
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = lineWidth;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(leftX, leftY); ctx.lineTo(rightX, rightY); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function baselineDeg() {
+    switch(baseAxis) {
+      case 'N': return 90;   // +Y
+      case 'W': return 180;  // -X
+      case 'S': return -90;  // -Y
+      case 'E':
+      default: return 0;     // +X
+    }
+  }
+  function normalizeSigned(deg) {
+    // map to (-180, 180]
+    let d = ((deg + 180) % 360 + 360) % 360 - 180;
+    if (d === -180) d = 180;
+    return d;
+  }
+
+  function drawVectorLabel(tail, head, vLike, isResult=false) {
+    const mid = { x: (tail.x + head.x)/2, y: (tail.y + head.y)/2 };
+    const m = worldToScreen(mid.x, mid.y);
+    const len = Math.hypot(vLike.dx, vLike.dy);
+    const angX = Math.atan2(vLike.dy, vLike.dx) * 180/Math.PI; // vs +x, math coords
+    const base = baselineDeg();
+    const diff = normalizeSigned(angX - base); // signed shortest angle from baseline to vector
+
+    const text = `${isResult? '∑ ': ''}‖v‖=${len.toFixed(3)}  ∠${baseAxis}=${Math.abs(diff).toFixed(1)}°`;
+    ctx.save();
+    ctx.font = '12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = 'rgba(230,232,239,.95)';
+    // Halo for contrast
+    ctx.strokeStyle = 'rgba(15,18,32,.8)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(text, m.x, m.y - 6);
+    ctx.fillText(text, m.x, m.y - 6);
+    ctx.restore();
+
+    // Arc from baseline to vector direction (math coords CCW positive)
+    const center = worldToScreen(tail.x, tail.y);
+    drawAngleArcMath(center.x, center.y, 18, base, diff, isResult ? getVar('--result') : getVar('--vector'));
+  }
+
+  function drawAngleArcMath(cx, cy, r, baseDeg, diffDeg, color) {
+    // Render arc using math angles (y up), but convert to screen (y down) with y flip.
+    const steps = Math.max(6, Math.min(48, Math.round(Math.abs(diffDeg) / 3)));
+    if (!isFinite(steps) || steps <= 0) return;
+    const start = baseDeg;
+    const end = baseDeg + diffDeg;
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const ang = start + (end - start) * t; // degrees in math coords
+      const rad = ang * Math.PI/180;
+      const x = cx + r * Math.cos(rad);
+      const y = cy - r * Math.sin(rad); // flip for screen
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function resultant() {
+    if (!vectors.length) return null;
+    let x=0,y=0; for (const v of vectors) { x+=v.dx; y+=v.dy; }
+    return { x, y };
+  }
+
+  function updateHUD() {
+    const w = screenToWorld(mouse.x, mouse.y);
+    const liveLen = creating ? Math.hypot(w.x, w.y) : 0;
+    const liveAng = creating ? Math.atan2(w.y, w.x) * 180/Math.PI : 0;
+    const diffLive = creating ? Math.abs(normalizeSigned(liveAng - baselineDeg())).toFixed(1) : '0.0';
+
+    const res = resultant();
+    const resLen = res ? Math.hypot(res.x, res.y).toFixed(3) : '0.000';
+    const resAng = res ? (Math.atan2(res.y, res.x) * 180/Math.PI).toFixed(1) : '0.0';
+
+    hud.innerHTML = `
+      <div class="hud-row">Mouse (world): <span class="mono">x=${w.x.toFixed(3)}</span> <span class="mono">y=${w.y.toFixed(3)}</span></div>
+      <div class="hud-row">Resultant: <span class="mono">‖∑v‖=${resLen}</span> <span class="mono">∠x=${resAng}°</span></div>
+      <div class="hud-row">Scale: <span class="mono">1 unit = ${Math.round(scale)} px</span> · Zoom <span class="kbd">wheel</span> · Pan <span class="kbd">left‑drag</span></div>
+      ${creating ? `<div class="hud-row">Creating: <span class="mono">‖v‖=${liveLen.toFixed(3)}</span> <span class="mono">∠${baseAxis}=${diffLive}°</span> · Click to place</div>` : ''}
+    `;
+    scaleChip.textContent = `scale: 1 unit = ${Math.round(scale)} px`;
+  }
+
+  function render() {
+    drawGrid();
+    drawVectors();
+    updateHUD();
+  }
+
+  // Interaction
+  let panning = false; let panStart = {x:0,y:0}; let offsetStart = {x:0,y:0};
+
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - rect.left; mouse.y = e.clientY - rect.top;
+    if (panning) {
+      offset.x = offsetStart.x + (mouse.x - panStart.x);
+      offset.y = offsetStart.y + (mouse.y - panStart.y);
+    }
+    render();
+  });
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 0) {
+      if (creating) {
+        // finalize new vector defined from origin to mouse (in world coords)
+        const w = screenToWorld(mouse.x, mouse.y);
+        if (Math.hypot(w.x, w.y) > 1e-6) {
+          vectors.push({ dx: w.x, dy: w.y });
+          showToast('Vector added ✔');
+        }
+        creating = false;
+        render();
+      } else {
+        // start panning on left-drag when not creating
+        panning = true; panStart = {x: mouse.x, y: mouse.y}; offsetStart = {...offset};
+      }
+    }
+  });
+  window.addEventListener('mouseup', () => { panning = false; });
+
+  // Zoom with mouse wheel
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const base = 1.12;      // original step
+    const speed = 1/3;      // 3x slower zoom
+    const zoomFactor = Math.pow(base, -Math.sign(e.deltaY) * speed);    
+    const mouseWorldBefore = screenToWorld(mouse.x, mouse.y);
+    const newScale = clamp(scale * zoomFactor, SCALE_MIN, SCALE_MAX);
+    if (newScale !== scale) {
+      scale = newScale;
+      // Keep mouse point stationary (zoom towards cursor)
+      const mouseScreenAfter = worldToScreen(mouseWorldBefore.x, mouseWorldBefore.y);
+      offset.x += (mouse.x - mouseScreenAfter.x);
+      offset.y += (mouse.y - mouseScreenAfter.y);
+      render();
+    }
+  }, { passive:false });
+
+  // Controls
+  document.getElementById('addBtn').addEventListener('click', () => { creating = true; render(); });
+  document.getElementById('undoBtn').addEventListener('click', () => { if (vectors.length) { vectors.pop(); render(); } });
+  document.getElementById('clearBtn').addEventListener('click', () => { vectors.length = 0; render(); });
+  document.getElementById('zoomIn').addEventListener('click', () => zoomAtCenter(1.2));
+  document.getElementById('zoomOut').addEventListener('click', () => zoomAtCenter(1/1.2));
+  document.getElementById('resetView').addEventListener('click', () => { fitAll(true); render(); });
+
+  function zoomAtCenter(f) {
+    const cx = width/2, cy = height/2;
+    const worldBefore = screenToWorld(cx, cy);
+    scale = clamp(scale * f, SCALE_MIN, SCALE_MAX);
+    const screenAfter = worldToScreen(worldBefore.x, worldBefore.y);
+    offset.x += (cx - screenAfter.x);
+    offset.y += (cy - screenAfter.y);
+    render();
+  }
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  // Fit All keeps origin & all cumulative heads in view (button only)
+  function fitAll(preserveIfEmpty=false) {
+    const points = [{x:0,y:0}];
+    let tail = {x:0,y:0};
+    for (const v of vectors) { tail = {x: tail.x + v.dx, y: tail.y + v.dy}; points.push({...tail}); }
+    if (preserveIfEmpty && points.length === 1) return; // nothing placed
+
+    let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+    for (const p of points) { minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x); minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y); }
+    if (!isFinite(minX)) { minX = maxX = minY = maxY = 0; }
+
+    const pad = 0.2; // 20% margin
+    const w = Math.max(1e-6, maxX - minX); const h = Math.max(1e-6, maxY - minY);
+    const viewW = width * 0.86; const viewH = height * 0.86; // leave space for labels/HUD
+    const s = Math.min(viewW / (w * (1+pad)), viewH / (h * (1+pad)));
+    scale = clamp(s, SCALE_MIN, SCALE_MAX);
+
+    const cx = (minX + maxX)/2; const cy = (minY + maxY)/2;
+    const screenCenter = { x: width/2, y: height/2 };
+    const sc = worldToScreen(cx, cy);
+    offset.x += (screenCenter.x - sc.x);
+    offset.y += (screenCenter.y - sc.y);
+  }
+
+  function showToast(msg) {
+    toast.textContent = msg;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 1200);
+  }
+
+  // Resize handling
+  const ro = new ResizeObserver(() => { setCanvasSize(); render(); });
+  ro.observe(document.querySelector('.canvas-wrap'));
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => { setCanvasSize(); render(); });
+  }
+  window.addEventListener('resize', () => { setCanvasSize(); render(); });
+  setCanvasSize();
+  // Center origin initially
+  offset = { x: width/2, y: height/2 };
+  render();
+
+  // Accessibility: prevent context menu so clicks feel crisp
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+})();
+</script>
+</body>
+</html>
